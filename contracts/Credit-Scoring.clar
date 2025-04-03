@@ -57,7 +57,11 @@
     due-time: uint,
     status: (string-ascii 20),  ;; "active", "completed", "defaulted"
     amount-repaid: uint,
-    last-repayment: uint
+    last-repayment: uint,
+    collateral-amount: uint,
+    collateral-claimed: bool,
+    extensions-used: uint      ;; New field
+
   }
 )
 
@@ -129,7 +133,11 @@
         due-time: (+ stacks-block-height (* duration-days u144)), ;; Assuming ~144 blocks per day
         status: "active",
         amount-repaid: u0,
-        last-repayment: u0
+        last-repayment: u0,
+        collateral-amount: u0,
+        collateral-claimed: false,
+        extensions-used: u0
+
       }
     )
     
@@ -192,7 +200,11 @@
           due-time: (get due-time loan),
           status: new-status,
           amount-repaid: new-amount-repaid,
-          last-repayment: stacks-block-height
+          last-repayment: stacks-block-height,
+          collateral-amount: (get collateral-amount loan),
+          collateral-claimed: (get collateral-claimed loan),
+          extensions-used: u0
+
         }
       )
       
@@ -229,8 +241,8 @@
 ;; Mark a loan as defaulted (admin only)
 (define-public (mark-loan-defaulted (loan-id uint))
   (let (
-        (admin-principal (var-get admin))
-        (loan (unwrap! (map-get? loans { loan-id: loan-id }) ERR-LOAN-NOT-FOUND))
+          (admin-principal (var-get admin))
+          (loan (unwrap! (map-get? loanss { loan-id: loan-id }) ERR-LOAN-NOT-FOUND))
       )
     
     ;; Only admin can mark loans as defaulted
@@ -257,7 +269,11 @@
           due-time: (get due-time loan),
           status: "defaulted",
           amount-repaid: (get amount-repaid loan),
-          last-repayment: (get last-repayment loan)
+          last-repayment: (get last-repayment loan),
+          collateral-amount: (get collateral-amount loan),
+          collateral-claimed: (get collateral-claimed loan),
+          extensions-used: u0
+
         }
       )
       
@@ -399,6 +415,345 @@
               ))
         )
         (err ERR-LOAN-NOT-FOUND)
+    )
+  )
+)
+
+
+;; Add to constants section
+(define-constant ERR-INSUFFICIENT-COLLATERAL (err u108))
+(define-constant ERR-COLLATERAL-ALREADY-CLAIMED (err u109))
+
+;; Update loans map to include collateral
+(define-map loanss
+  { loan-id: uint }
+  {
+    borrower: principal,
+    amount: uint,
+    duration-days: uint,
+    interest-rate: uint,
+    start-time: uint,
+    due-time: uint,
+    status: (string-ascii 20),  ;; "active", "completed", "defaulted"
+    amount-repaid: uint,
+    last-repayment: uint,
+    collateral-amount: uint,    ;; New field
+    collateral-claimed: bool    ;; New field
+  }
+)
+
+;; Create a loan with collateral
+(define-public (create-collateralized-loan (amount uint) (duration-days uint) (interest-rate uint) (collateral-amount uint))
+  (let (
+        (loan-id (var-get next-loan-id))
+        (user-data (default-to 
+                    {
+                      score: INITIAL-SCORE,
+                      total-loans: u0,
+                      active-loans: u0,
+                      completed-loans: u0,
+                      defaulted-loans: u0,
+                      last-updated: stacks-block-height
+                    } 
+                    (map-get? user-scores { user: tx-sender })))
+        (user-loan-data (default-to { loan-ids: (list) } (map-get? user-loans { user: tx-sender })))
+      )
+    
+    ;; Validate inputs
+    (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+    (asserts! (> duration-days u0) ERR-INVALID-DURATION)
+    (asserts! (>= collateral-amount (/ amount u4)) ERR-INSUFFICIENT-COLLATERAL) ;; Collateral must be at least 25% of loan
+    
+    ;; Transfer collateral to contract (assuming STX)
+    (try! (stx-transfer? collateral-amount tx-sender (as-contract tx-sender)))
+    
+    ;; Create the loan
+    (map-set loans
+      { loan-id: loan-id }
+      {
+        borrower: tx-sender,
+        amount: amount,
+        duration-days: duration-days,
+        interest-rate: interest-rate,
+        start-time: stacks-block-height,
+        due-time: (+ stacks-block-height (* duration-days u144)),
+        status: "active",
+        amount-repaid: u0,
+        last-repayment: u0,
+        collateral-amount: collateral-amount,
+        collateral-claimed: false,
+        extensions-used: u0
+
+      }
+    )
+    
+    ;; Update user data
+    (map-set user-scores
+      { user: tx-sender }
+      {
+        score: (get score user-data),
+        total-loans: (+ (get total-loans user-data) u1),
+        active-loans: (+ (get active-loans user-data) u1),
+        completed-loans: (get completed-loans user-data),
+        defaulted-loans: (get defaulted-loans user-data),
+        last-updated: stacks-block-height
+      }
+    )
+    
+    ;; Update user loan history
+    (map-set user-loans
+      { user: tx-sender }
+      { loan-ids: (unwrap! (as-max-len? (append (get loan-ids user-loan-data) loan-id) u50) ERR-NOT-AUTHORIZED) }
+    )
+    
+    ;; Increment loan ID
+    (var-set next-loan-id (+ loan-id u1))
+    
+    (ok loan-id)
+  )
+)
+
+;; Return collateral when loan is repaid
+(define-public (return-collateral (loan-id uint))
+  (let (
+        (loan (unwrap! (map-get? loans { loan-id: loan-id }) ERR-LOAN-NOT-FOUND))
+      )
+    
+    ;; Validate the loan belongs to the sender
+    (asserts! (is-eq (get borrower loan) tx-sender) ERR-NOT-AUTHORIZED)
+    ;; Validate the loan is completed
+    (asserts! (is-eq (get status loan) "completed") ERR-LOAN-NOT-ACTIVE)
+    ;; Validate collateral hasn't been claimed
+    ;; (asserts! (not (get collateral-claimed loan)) ERR-COLLATERAL-ALREADY-CLAIMED)
+    
+    ;; Return collateral to borrower
+    ;; (try! (as-contract (stx-transfer? (get collateral loan) tx-sender (get borrower loan))))
+    
+    ;; Update loan to mark collateral as claimed
+    ;; (map-set loans
+    ;;   { loan-id: loan-id }
+    ;;   (merge loan { collateral-claimed: true })
+    ;; )
+    
+    (ok true)
+  )
+)
+
+;; Claim collateral when loan is defaulted (admin only)
+(define-public (claim-defaulted-collateral (loan-id uint))
+  (let (
+        (admin-principal (var-get admin))
+        (loan (unwrap! (map-get? loans { loan-id: loan-id }) ERR-LOAN-NOT-FOUND))
+      )
+    
+    ;; Only admin can claim collateral
+    (asserts! (is-eq tx-sender admin-principal) ERR-NOT-AUTHORIZED)
+    ;; Validate the loan is defaulted
+    (asserts! (is-eq (get status loan) "defaulted") ERR-LOAN-NOT-ACTIVE)
+    ;; Validate collateral hasn't been claimed
+    (asserts! (not (get collateral-claimed loan)) ERR-COLLATERAL-ALREADY-CLAIMED)
+    
+    ;; Update loan to mark collateral as claimed
+    (map-set loans
+      { loan-id: loan-id }
+      (merge loan { collateral-claimed: true })
+    )
+    
+    (ok true)
+  )
+)
+
+
+
+;; Add to constants section
+(define-constant ERR-EXTENSION-NOT-ALLOWED (err u110))
+(define-constant MAX-EXTENSIONS u3)
+
+
+;; Request a loan extension
+(define-public (extend-loan (loan-id uint) (additional-days uint))
+  (let (
+        (loan (unwrap! (map-get? loans { loan-id: loan-id }) ERR-LOAN-NOT-FOUND))
+        (user-data (unwrap! (map-get? user-scores { user: (get borrower loan) }) ERR-NOT-AUTHORIZED))
+      )
+    
+    ;; Validate the loan belongs to the sender
+    (asserts! (is-eq (get borrower loan) tx-sender) ERR-NOT-AUTHORIZED)
+    ;; Validate the loan is active
+    (asserts! (is-eq (get status loan) "active") ERR-LOAN-NOT-ACTIVE)
+    ;; Validate extension days
+    (asserts! (> additional-days u0) ERR-INVALID-DURATION)
+    ;; Validate extensions limit
+    (asserts! (< (get extensions-used loan) MAX-EXTENSIONS) ERR-EXTENSION-NOT-ALLOWED)
+    
+    (let (
+          (new-due-time (+ (get due-time loan) (* additional-days u144)))
+          (new-extensions-used (+ (get extensions-used loan) u1))
+          (score-penalty u10)
+          (new-score (max-value u0 (- (get score user-data) score-penalty)))
+        )
+      
+      ;; Update loan data
+      (map-set loans
+        { loan-id: loan-id }
+        (merge loan {
+          due-time: new-due-time,
+          extensions-used: new-extensions-used
+        })
+      )
+      
+      ;; Update user score with penalty
+      (map-set user-scores
+        { user: tx-sender }
+        (merge user-data {
+          score: new-score,
+          last-updated: stacks-block-height
+        })
+      )
+      
+      (ok new-due-time)
+    )
+  )
+)
+
+
+
+;; Add to constants section
+(define-constant ERR-DISPUTE-ALREADY-EXISTS (err u111))
+(define-constant ERR-DISPUTE-NOT-FOUND (err u112))
+(define-constant ERR-INVALID-RESOLUTION (err u113))
+
+;; Define dispute status types
+(define-constant DISPUTE-STATUS-PENDING "pending")
+(define-constant DISPUTE-STATUS-APPROVED "approved")
+(define-constant DISPUTE-STATUS-REJECTED "rejected")
+
+;; Map to store credit score disputes
+(define-map credit-disputes
+  { user: principal, dispute-id: uint }
+  {
+    reason: (string-ascii 100),
+    requested-score: uint,
+    current-score: uint,
+    status: (string-ascii 20),
+    created-at: uint,
+    resolved-at: uint
+  }
+)
+
+;; Map to track user's dispute count
+(define-map user-disputes
+  { user: principal }
+  { 
+    count: uint,
+    active-dispute: bool
+  }
+)
+
+;; File a credit score dispute
+(define-public (file-dispute (reason (string-ascii 100)) (requested-score uint))
+  (let (
+        (user-data (unwrap! (map-get? user-scores { user: tx-sender }) ERR-NOT-AUTHORIZED))
+        (dispute-data (default-to { count: u0, active-dispute: false } (map-get? user-disputes { user: tx-sender })))
+      )
+    
+    ;; Validate no active dispute
+    (asserts! (not (get active-dispute dispute-data)) ERR-DISPUTE-ALREADY-EXISTS)
+    ;; Validate requested score
+    (asserts! (<= requested-score MAX-SCORE) ERR-INVALID-SCORE-PARAMS)
+    
+    (let (
+          (dispute-id (+ (get count dispute-data) u1))
+        )
+      
+      ;; Create dispute
+      (map-set credit-disputes
+        { user: tx-sender, dispute-id: dispute-id }
+        {
+          reason: reason,
+          requested-score: requested-score,
+          current-score: (get score user-data),
+          status: DISPUTE-STATUS-PENDING,
+          created-at: stacks-block-height,
+          resolved-at: u0
+        }
+      )
+      
+      ;; Update user dispute data
+      (map-set user-disputes
+        { user: tx-sender }
+        {
+          count: dispute-id,
+          active-dispute: true
+        }
+      )
+      
+      (ok dispute-id)
+    )
+  )
+)
+
+;; Resolve a credit score dispute (admin only)
+(define-public (resolve-dispute (user principal) (dispute-id uint) (approved bool) (new-score uint))
+  (let (
+        (admin-principal (var-get admin))
+        (dispute (unwrap! (map-get? credit-disputes { user: user, dispute-id: dispute-id }) ERR-DISPUTE-NOT-FOUND))
+        (user-data (unwrap! (map-get? user-scores { user: user }) ERR-NOT-AUTHORIZED))
+        (dispute-data (unwrap! (map-get? user-disputes { user: user }) ERR-DISPUTE-NOT-FOUND))
+      )
+    
+    ;; Only admin can resolve disputes
+    (asserts! (is-eq tx-sender admin-principal) ERR-NOT-AUTHORIZED)
+    ;; Validate dispute is pending
+    (asserts! (is-eq (get status dispute) DISPUTE-STATUS-PENDING) ERR-INVALID-RESOLUTION)
+    ;; Validate new score if approved
+    (asserts! (or (not approved) (<= new-score MAX-SCORE)) ERR-INVALID-SCORE-PARAMS)
+    
+    (let (
+          (resolution-status (if approved DISPUTE-STATUS-APPROVED DISPUTE-STATUS-REJECTED))
+          (final-score (if approved new-score (get score user-data)))
+        )
+      
+      ;; Update dispute
+      (map-set credit-disputes
+        { user: user, dispute-id: dispute-id }
+        (merge dispute {
+          status: resolution-status,
+          resolved-at: stacks-block-height
+        })
+      )
+      
+      ;; Update user dispute data
+      (map-set user-disputes
+        { user: user }
+        (merge dispute-data {
+          active-dispute: false
+        })
+      )
+      
+      ;; Update user score if approved
+      (if approved
+          (map-set user-scores
+            { user: user }
+            (merge user-data {
+              score: final-score,
+              last-updated: stacks-block-height
+            })
+          )
+          true
+      )
+      
+      (ok final-score)
+    )
+  )
+)
+
+;; Get dispute details
+(define-read-only (get-dispute-details (user principal) (dispute-id uint))
+  (let ((dispute (map-get? credit-disputes { user: user, dispute-id: dispute-id })))
+    (if (is-some dispute)
+        (ok (unwrap-panic dispute))
+        (err ERR-DISPUTE-NOT-FOUND)
     )
   )
 )
