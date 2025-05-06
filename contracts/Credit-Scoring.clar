@@ -757,3 +757,125 @@
     )
   )
 )
+
+
+(define-constant RECOVERY-MIN-STAKE u1000000)
+(define-constant RECOVERY-MIN-BLOCKS u14400)
+(define-constant RECOVERY-SCORE-BOOST u5)
+(define-constant ERR-INSUFFICIENT-STAKE (err u120))
+(define-constant ERR-ALREADY-IN-RECOVERY (err u121))
+
+(define-map recovery-programs
+  { user: principal }
+  {
+    stake-amount: uint,
+    start-block: uint,
+    last-boost: uint
+  }
+)
+
+(define-public (start-recovery-program (stake-amount uint))
+  (let (
+    (user-data (unwrap! (map-get? user-scores { user: tx-sender }) ERR-NOT-AUTHORIZED))
+    (existing-program (map-get? recovery-programs { user: tx-sender }))
+    )
+    
+    (asserts! (is-none existing-program) ERR-ALREADY-IN-RECOVERY)
+    (asserts! (>= stake-amount RECOVERY-MIN-STAKE) ERR-INSUFFICIENT-STAKE)
+    
+    (try! (stx-transfer? stake-amount tx-sender (as-contract tx-sender)))
+    
+    (map-set recovery-programs
+      { user: tx-sender }
+      {
+        stake-amount: stake-amount,
+        start-block: stacks-block-height,
+        last-boost: stacks-block-height
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (claim-recovery-boost)
+  (let (
+    (program (unwrap! (map-get? recovery-programs { user: tx-sender }) ERR-NOT-AUTHORIZED))
+    (user-data (unwrap! (map-get? user-scores { user: tx-sender }) ERR-NOT-AUTHORIZED))
+    (blocks-staked (- stacks-block-height (get last-boost program)))
+    )
+    
+    (asserts! (>= blocks-staked RECOVERY-MIN-BLOCKS) ERR-NOT-AUTHORIZED)
+    
+    (map-set user-scores
+      { user: tx-sender }
+      (merge user-data {
+        score: (min-value (+ (get score user-data) RECOVERY-SCORE-BOOST) MAX-SCORE),
+        last-updated: stacks-block-height
+      })
+    )
+    
+    (map-set recovery-programs
+      { user: tx-sender }
+      (merge program { last-boost: stacks-block-height })
+    )
+    (ok true)
+  )
+)
+
+
+(define-constant INSURANCE-COST u100000) 
+(define-constant INSURANCE-DURATION u14400)
+(define-constant INSURANCE-THRESHOLD u50)
+(define-constant ERR-INSURANCE-EXISTS (err u130))
+
+(define-map credit-insurance
+  { user: principal }
+  {
+    start-block: uint,
+    end-block: uint,
+    base-score: uint
+  }
+)
+
+(define-public (purchase-insurance)
+  (let (
+    (user-data (unwrap! (map-get? user-scores { user: tx-sender }) ERR-NOT-AUTHORIZED))
+    (existing-insurance (map-get? credit-insurance { user: tx-sender }))
+    )
+    
+    (asserts! (is-none existing-insurance) ERR-INSURANCE-EXISTS)
+    (try! (stx-transfer? INSURANCE-COST tx-sender (as-contract tx-sender)))
+    
+    (map-set credit-insurance
+      { user: tx-sender }
+      {
+        start-block: stacks-block-height,
+        end-block: (+ stacks-block-height INSURANCE-DURATION),
+        base-score: (get score user-data)
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (claim-insurance)
+  (let (
+    (insurance (unwrap! (map-get? credit-insurance { user: tx-sender }) ERR-NOT-AUTHORIZED))
+    (user-data (unwrap! (map-get? user-scores { user: tx-sender }) ERR-NOT-AUTHORIZED))
+    )
+    
+    (asserts! (<= stacks-block-height (get end-block insurance)) ERR-NOT-AUTHORIZED)
+    (asserts! (>= (- (get base-score insurance) (get score user-data)) INSURANCE-THRESHOLD) ERR-NOT-AUTHORIZED)
+    
+    (map-set user-scores
+      { user: tx-sender } 
+      (merge user-data {
+        score: (get base-score insurance),
+        last-updated: stacks-block-height
+      })
+    )
+    
+    (map-delete credit-insurance { user: tx-sender })
+    (ok true)
+  )
+)
