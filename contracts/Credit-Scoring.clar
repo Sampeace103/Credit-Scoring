@@ -879,3 +879,248 @@
     (ok true)
   )
 )
+
+(define-constant ERR-VERIFIER-NOT-AUTHORIZED (err u140))
+(define-constant ERR-ATTESTATION-NOT-FOUND (err u141))
+(define-constant ERR-ATTESTATION-EXPIRED (err u142))
+(define-constant ERR-INVALID-ATTESTATION (err u143))
+
+(define-constant ATTESTATION-DURATION u43200)
+(define-constant MAX-ATTESTATION-IMPACT u100)
+(define-constant MIN-ATTESTATION-IMPACT u10)
+
+(define-map authorized-verifiers
+  { verifier: principal }
+  {
+    name: (string-ascii 50),
+    reputation-score: uint,
+    total-attestations: uint,
+    active: bool,
+    authorized-at: uint
+  }
+)
+
+(define-map credit-attestations
+  { user: principal, verifier: principal, attestation-id: uint }
+  {
+    score-impact: int,
+    confidence-level: uint,
+    attestation-type: (string-ascii 30),
+    created-at: uint,
+    expires-at: uint,
+    verified: bool,
+    metadata: (string-ascii 100)
+  }
+)
+
+(define-map user-attestation-summary
+  { user: principal }
+  {
+    total-attestations: uint,
+    positive-attestations: uint,
+    negative-attestations: uint,
+    last-attestation: uint,
+    attestation-score-boost: int
+  }
+)
+
+(define-data-var next-attestation-id uint u1)
+
+(define-public (authorize-verifier (verifier principal) (name (string-ascii 50)))
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-AUTHORIZED)
+    (map-set authorized-verifiers
+      { verifier: verifier }
+      {
+        name: name,
+        reputation-score: u100,
+        total-attestations: u0,
+        active: true,
+        authorized-at: stacks-block-height
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (revoke-verifier (verifier principal))
+  (let (
+    (verifier-data (unwrap! (map-get? authorized-verifiers { verifier: verifier }) ERR-VERIFIER-NOT-AUTHORIZED))
+    )
+    (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-AUTHORIZED)
+    (map-set authorized-verifiers
+      { verifier: verifier }
+      (merge verifier-data { active: false })
+    )
+    (ok true)
+  )
+)
+
+(define-public (create-attestation (user principal) (score-impact int) (confidence-level uint) (attestation-type (string-ascii 30)) (metadata (string-ascii 100)))
+  (let (
+    (verifier-data (unwrap! (map-get? authorized-verifiers { verifier: tx-sender }) ERR-VERIFIER-NOT-AUTHORIZED))
+    (attestation-id (var-get next-attestation-id))
+    (user-summary (default-to 
+      {
+        total-attestations: u0,
+        positive-attestations: u0,
+        negative-attestations: u0,
+        last-attestation: u0,
+        attestation-score-boost: 0
+      }
+      (map-get? user-attestation-summary { user: user })
+    ))
+    )
+    
+    (asserts! (get active verifier-data) ERR-VERIFIER-NOT-AUTHORIZED)
+    ;; (asserts! (and (>= score-impact (- MAX-ATTESTATION-IMPACT)) (<= score-impact (to-int MAX-ATTESTATION-IMPACT))) ERR-INVALID-ATTESTATION)
+    (asserts! (and (>= confidence-level u1) (<= confidence-level u100)) ERR-INVALID-ATTESTATION)
+    
+    (map-set credit-attestations
+      { user: user, verifier: tx-sender, attestation-id: attestation-id }
+      {
+        score-impact: score-impact,
+        confidence-level: confidence-level,
+        attestation-type: attestation-type,
+        created-at: stacks-block-height,
+        expires-at: (+ stacks-block-height ATTESTATION-DURATION),
+        verified: true,
+        metadata: metadata
+      }
+    )
+    
+    (map-set authorized-verifiers
+      { verifier: tx-sender }
+      (merge verifier-data { total-attestations: (+ (get total-attestations verifier-data) u1) })
+    )
+    
+    (let (
+      (is-positive (> score-impact 0))
+      (new-positive (if is-positive (+ (get positive-attestations user-summary) u1) (get positive-attestations user-summary)))
+      (new-negative (if is-positive (get negative-attestations user-summary) (+ (get negative-attestations user-summary) u1)))
+      )
+      
+      (map-set user-attestation-summary
+        { user: user }
+        {
+          total-attestations: (+ (get total-attestations user-summary) u1),
+          positive-attestations: new-positive,
+          negative-attestations: new-negative,
+          last-attestation: stacks-block-height,
+          attestation-score-boost: (+ (get attestation-score-boost user-summary) score-impact)
+        }
+      )
+    )
+    
+    (var-set next-attestation-id (+ attestation-id u1))
+    (ok attestation-id)
+  )
+)
+
+(define-public (apply-attestation-boost (user principal))
+  (let (
+    (user-data (unwrap! (map-get? user-scores { user: user }) ERR-NOT-AUTHORIZED))
+    (attestation-summary (unwrap! (map-get? user-attestation-summary { user: user }) ERR-ATTESTATION-NOT-FOUND))
+    (current-boost (get attestation-score-boost attestation-summary))
+    (current-score (get score user-data))
+    )
+    
+    (asserts! (is-eq tx-sender user) ERR-NOT-AUTHORIZED)
+    (asserts! (not (is-eq current-boost 0)) ERR-INVALID-ATTESTATION)
+    
+    (let (
+      (new-score (if (> current-boost 0)
+        (min-value (+ current-score (to-uint current-boost)) MAX-SCORE)
+        (max-value (if (>= current-score (to-uint (- current-boost))) (- current-score (to-uint (- current-boost))) u0) u0)
+      ))
+      )
+      
+      (map-set user-scores
+        { user: user }
+        (merge user-data {
+          score: new-score,
+          last-updated: stacks-block-height
+        })
+      )
+      
+      (map-set user-attestation-summary
+        { user: user }
+        (merge attestation-summary { attestation-score-boost: 0 })
+      )
+      
+      (ok new-score)
+    )
+  )
+)
+
+(define-read-only (get-verifier-info (verifier principal))
+  (let ((verifier-data (map-get? authorized-verifiers { verifier: verifier })))
+    (if (is-some verifier-data)
+      (ok (unwrap-panic verifier-data))
+      (err ERR-VERIFIER-NOT-AUTHORIZED)
+    )
+  )
+)
+
+(define-read-only (get-attestation-details (user principal) (verifier principal) (attestation-id uint))
+  (let ((attestation (map-get? credit-attestations { user: user, verifier: verifier, attestation-id: attestation-id })))
+    (if (is-some attestation)
+      (ok (unwrap-panic attestation))
+      (err ERR-ATTESTATION-NOT-FOUND)
+    )
+  )
+)
+
+(define-read-only (get-user-attestation-summary (user principal))
+  (let ((summary (map-get? user-attestation-summary { user: user })))
+    (if (is-some summary)
+      (ok (unwrap-panic summary))
+      (err ERR-ATTESTATION-NOT-FOUND)
+    )
+  )
+)
+
+(define-read-only (calculate-attestation-weighted-score (user principal))
+  (let (
+    (user-data (map-get? user-scores { user: user }))
+    (attestation-summary (map-get? user-attestation-summary { user: user }))
+    )
+    
+    (if (and (is-some user-data) (is-some attestation-summary))
+      (let (
+        (base-score (get score (unwrap-panic user-data)))
+        (attestation-boost (get attestation-score-boost (unwrap-panic attestation-summary)))
+        (total-attestations (get total-attestations (unwrap-panic attestation-summary)))
+        )
+        
+        (if (> total-attestations u0)
+          (let (
+            (weighted-boost (/ attestation-boost (to-int total-attestations)))
+            (final-score (if (> weighted-boost 0)
+              (min-value (+ base-score (to-uint weighted-boost)) MAX-SCORE)
+              (max-value (if (>= base-score (to-uint (- weighted-boost))) (- base-score (to-uint (- weighted-boost))) u0) u0)
+            ))
+            )
+            (ok final-score)
+          )
+          (ok base-score)
+        )
+      )
+      (err ERR-NOT-AUTHORIZED)
+    )
+  )
+)
+
+(define-read-only (is-attestation-valid (user principal) (verifier principal) (attestation-id uint))
+  (let ((attestation (map-get? credit-attestations { user: user, verifier: verifier, attestation-id: attestation-id })))
+    (if (is-some attestation)
+      (let ((attestation-data (unwrap-panic attestation)))
+        (ok (and 
+          (get verified attestation-data)
+          (< stacks-block-height (get expires-at attestation-data))
+        ))
+      )
+      (err ERR-ATTESTATION-NOT-FOUND)
+    )
+  )
+)
