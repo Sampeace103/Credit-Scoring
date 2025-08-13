@@ -1124,3 +1124,422 @@
     )
   )
 )
+
+;; === PREDICTIVE RISK ASSESSMENT ENGINE ===
+
+;; Risk prediction constants
+(define-constant PREDICTION-WINDOW u30240) ;; ~6 months in blocks
+(define-constant MIN-DATA-POINTS u3)
+(define-constant RISK-EXCELLENT u10) ;; 1-10% risk
+(define-constant RISK-LOW u25) ;; 11-25% risk  
+(define-constant RISK-MODERATE u50) ;; 26-50% risk
+(define-constant RISK-HIGH u75) ;; 51-75% risk
+(define-constant RISK-EXTREME u100) ;; 76-100% risk
+
+;; Error constants for risk engine
+(define-constant ERR-INSUFFICIENT-HISTORY (err u300))
+(define-constant ERR-PREDICTION-EXISTS (err u301))
+(define-constant ERR-PREDICTION-NOT-FOUND (err u302))
+
+;; User behavior tracking for predictions
+(define-map user-behavior-patterns
+  { user: principal }
+  {
+    avg-payment-delay: uint, ;; Average blocks late
+    payment-consistency: uint, ;; 0-100 consistency score
+    loan-frequency: uint, ;; Loans per time period
+    repayment-velocity: uint, ;; Speed of repayments
+    score-trajectory: int, ;; Score change trend
+    risk-factors: uint, ;; Accumulated risk indicators
+    last-analysis: uint
+  }
+)
+
+;; Credit predictions with confidence levels
+(define-map credit-predictions
+  { user: principal, prediction-id: uint }
+  {
+    predicted-score: uint,
+    confidence-level: uint, ;; 0-100 confidence
+    risk-category: (string-ascii 20),
+    risk-percentage: uint,
+    prediction-horizon: uint, ;; Blocks into future
+    key-factors: (string-ascii 100),
+    created-at: uint,
+    expires-at: uint,
+    accuracy-tracked: bool
+  }
+)
+
+;; Risk assessment profiles
+(define-map risk-profiles
+  { user: principal }
+  {
+    overall-risk-score: uint,
+    default-probability: uint,
+    recommended-max-loan: uint,
+    risk-adjusted-rate: uint,
+    stability-index: uint,
+    last-updated: uint
+  }
+)
+
+;; Prediction accuracy tracking
+(define-map prediction-accuracy
+  { prediction-id: uint }
+  {
+    actual-score: uint,
+    predicted-score: uint,
+    accuracy-percentage: uint,
+    prediction-error: uint
+  }
+)
+
+(define-data-var next-prediction-id uint u1)
+
+;; Analyze user behavior patterns for risk assessment
+(define-public (analyze-behavior-pattern (user principal))
+  (let (
+    (user-data (unwrap! (map-get? user-scores { user: user }) ERR-NOT-AUTHORIZED))
+    (user-loan-data (default-to { loan-ids: (list) } (map-get? user-loans { user: user })))
+    )
+    
+    ;; Need minimum history to analyze
+    (asserts! (>= (get total-loans user-data) MIN-DATA-POINTS) ERR-INSUFFICIENT-HISTORY)
+    
+    (let (
+      ;; Calculate behavior metrics
+      (avg-delay (calculate-avg-payment-delay user))
+      (consistency (calculate-payment-consistency user-data))
+      (frequency (calculate-loan-frequency user-data))
+      (velocity (calculate-repayment-velocity user))
+      (trajectory (calculate-score-trajectory user-data))
+      (risk-factors (calculate-risk-factors user-data avg-delay))
+      )
+      
+      ;; Store behavior pattern
+      (map-set user-behavior-patterns
+        { user: user }
+        {
+          avg-payment-delay: avg-delay,
+          payment-consistency: consistency,
+          loan-frequency: frequency,
+          repayment-velocity: velocity,
+          score-trajectory: trajectory,
+          risk-factors: risk-factors,
+          last-analysis: stacks-block-height
+        }
+      )
+      
+      (ok true)
+    )
+  )
+)
+
+;; Generate credit score prediction
+(define-public (generate-prediction (user principal) (horizon-blocks uint))
+  (let (
+    (pattern (unwrap! (map-get? user-behavior-patterns { user: user }) ERR-INSUFFICIENT-HISTORY))
+    (user-data (unwrap! (map-get? user-scores { user: user }) ERR-NOT-AUTHORIZED))
+    (prediction-id (var-get next-prediction-id))
+    )
+    
+    (let (
+      ;; Calculate prediction components
+      (base-score (get score user-data))
+      (trend-impact (calculate-trend-impact (get score-trajectory pattern) horizon-blocks))
+      (risk-adjustment (calculate-risk-adjustment (get risk-factors pattern)))
+      (predicted-score (calculate-predicted-score base-score trend-impact risk-adjustment))
+      (confidence (calculate-confidence-level pattern))
+      (risk-category (determine-risk-category (get risk-factors pattern)))
+      (risk-percentage (calculate-risk-percentage pattern))
+      )
+      
+      ;; Store prediction
+      (map-set credit-predictions
+        { user: user, prediction-id: prediction-id }
+        {
+          predicted-score: predicted-score,
+          confidence-level: confidence,
+          risk-category: risk-category,
+          risk-percentage: risk-percentage,
+          prediction-horizon: horizon-blocks,
+          key-factors: (generate-key-factors pattern),
+          created-at: stacks-block-height,
+          expires-at: (+ stacks-block-height horizon-blocks),
+          accuracy-tracked: false
+        }
+      )
+      
+      ;; Increment prediction ID
+      (var-set next-prediction-id (+ prediction-id u1))
+      
+      (ok prediction-id)
+    )
+  )
+)
+
+;; Create comprehensive risk profile
+(define-public (create-risk-profile (user principal))
+  (let (
+    (pattern (unwrap! (map-get? user-behavior-patterns { user: user }) ERR-INSUFFICIENT-HISTORY))
+    (user-data (unwrap! (map-get? user-scores { user: user }) ERR-NOT-AUTHORIZED))
+    )
+    
+    (let (
+      (overall-risk (calculate-overall-risk pattern user-data))
+      (default-prob (calculate-default-probability pattern))
+      (max-loan (calculate-safe-loan-amount user-data overall-risk))
+      (risk-rate (calculate-risk-adjusted-rate user-data overall-risk))
+      (stability (calculate-stability-index pattern))
+      )
+      
+      (map-set risk-profiles
+        { user: user }
+        {
+          overall-risk-score: overall-risk,
+          default-probability: default-prob,
+          recommended-max-loan: max-loan,
+          risk-adjusted-rate: risk-rate,
+          stability-index: stability,
+          last-updated: stacks-block-height
+        }
+      )
+      
+      (ok overall-risk)
+    )
+  )
+)
+
+;; Private helper functions for calculations
+
+(define-private (calculate-avg-payment-delay (user principal))
+  ;; Analyzes payment behavior patterns
+  (let (
+    (user-data (default-to 
+      { score: u650, total-loans: u0, active-loans: u0, completed-loans: u0, defaulted-loans: u0, last-updated: u0 }
+      (map-get? user-scores { user: user })
+    ))
+    )
+    ;; Risk factor based on defaults and score
+    (if (> (get defaulted-loans user-data) u0)
+      (+ u100 (* (get defaulted-loans user-data) u50))
+      (if (< (get score user-data) u600) u75 u25)
+    )
+  )
+)
+
+(define-private (calculate-payment-consistency (user-data { score: uint, total-loans: uint, active-loans: uint, completed-loans: uint, defaulted-loans: uint, last-updated: uint }))
+  (let (
+    (total-loans (get total-loans user-data))
+    (completed-loans (get completed-loans user-data))
+    (defaulted-loans (get defaulted-loans user-data))
+    )
+    (if (is-eq total-loans u0)
+      u50 ;; Default consistency for new users
+      (/ (* (- total-loans defaulted-loans) u100) total-loans)
+    )
+  )
+)
+
+(define-private (calculate-loan-frequency (user-data { score: uint, total-loans: uint, active-loans: uint, completed-loans: uint, defaulted-loans: uint, last-updated: uint }))
+  ;; Frequency per time period
+  (min-value (get total-loans user-data) u10)
+)
+
+(define-private (calculate-repayment-velocity (user principal))
+  ;; Speed of repayments - baseline metric
+  u50
+)
+
+(define-private (calculate-score-trajectory (user-data { score: uint, total-loans: uint, active-loans: uint, completed-loans: uint, defaulted-loans: uint, last-updated: uint }))
+  ;; Score change trend analysis
+  (let (
+    (current-score (get score user-data))
+    (defaults (get defaulted-loans user-data))
+    )
+    (if (> defaults u0)
+      (- 0 (* (to-int defaults) 20)) ;; Negative trend
+      (if (>= current-score u700) 10 5) ;; Positive trend
+    )
+  )
+)
+
+(define-private (calculate-risk-factors (user-data { score: uint, total-loans: uint, active-loans: uint, completed-loans: uint, defaulted-loans: uint, last-updated: uint }) (avg-delay uint))
+  (let (
+    (defaults (get defaulted-loans user-data))
+    (score (get score user-data))
+    (active-loans (get active-loans user-data))
+    )
+    (+ 
+      (* defaults u30) ;; Each default adds 30 risk points
+      (if (< score u600) u25 u0) ;; Low score adds risk
+      (if (> active-loans u3) u15 u0) ;; Too many active loans
+      (if (> avg-delay u50) u20 u0) ;; Payment delays
+    )
+  )
+)
+
+(define-private (calculate-trend-impact (trajectory int) (horizon uint))
+  (* trajectory (to-int (/ horizon u5040))) ;; Impact over time periods
+)
+
+(define-private (calculate-risk-adjustment (risk-factors uint))
+  (if (> risk-factors u75) (- 0 50) ;; High risk: negative adjustment
+    (if (> risk-factors u50) (- 0 25) ;; Medium risk
+      (if (> risk-factors u25) (- 0 10) ;; Low-medium risk
+        0 ;; Low risk: no adjustment
+      )
+    )
+  )
+)
+
+(define-private (calculate-predicted-score (base-score uint) (trend-impact int) (risk-adjustment int))
+  (let (
+    (raw-prediction (+ (to-int base-score) trend-impact risk-adjustment))
+    )
+    (to-uint (if (< raw-prediction 0) 0 (if (> raw-prediction 850) 850 raw-prediction)))
+  )
+)
+
+(define-private (calculate-confidence-level (pattern { avg-payment-delay: uint, payment-consistency: uint, loan-frequency: uint, repayment-velocity: uint, score-trajectory: int, risk-factors: uint, last-analysis: uint }))
+  (let (
+    (consistency (get payment-consistency pattern))
+    (frequency (get loan-frequency pattern))
+    )
+    ;; Higher consistency and more data = higher confidence
+    (min-value u95 (+ consistency (min-value frequency u20)))
+  )
+)
+
+(define-private (determine-risk-category (risk-factors uint))
+  (if (<= risk-factors RISK-EXCELLENT) "Excellent"
+    (if (<= risk-factors RISK-LOW) "Low"
+      (if (<= risk-factors RISK-MODERATE) "Moderate"
+        (if (<= risk-factors RISK-HIGH) "High"
+          "Extreme"
+        )
+      )
+    )
+  )
+)
+
+(define-private (calculate-risk-percentage (pattern { avg-payment-delay: uint, payment-consistency: uint, loan-frequency: uint, repayment-velocity: uint, score-trajectory: int, risk-factors: uint, last-analysis: uint }))
+  (min-value u100 (get risk-factors pattern))
+)
+
+(define-private (generate-key-factors (pattern { avg-payment-delay: uint, payment-consistency: uint, loan-frequency: uint, repayment-velocity: uint, score-trajectory: int, risk-factors: uint, last-analysis: uint }))
+  (if (> (get risk-factors pattern) u50)
+    "High risk factors detected"
+    (if (< (get payment-consistency pattern) u70)
+      "Inconsistent payment history"
+      "Stable payment behavior"
+    )
+  )
+)
+
+(define-private (calculate-overall-risk (pattern { avg-payment-delay: uint, payment-consistency: uint, loan-frequency: uint, repayment-velocity: uint, score-trajectory: int, risk-factors: uint, last-analysis: uint }) (user-data { score: uint, total-loans: uint, active-loans: uint, completed-loans: uint, defaulted-loans: uint, last-updated: uint }))
+  (let (
+    (behavior-risk (get risk-factors pattern))
+    (score-risk (if (< (get score user-data) u600) u30 u10))
+    )
+    (min-value u100 (+ behavior-risk score-risk))
+  )
+)
+
+(define-private (calculate-default-probability (pattern { avg-payment-delay: uint, payment-consistency: uint, loan-frequency: uint, repayment-velocity: uint, score-trajectory: int, risk-factors: uint, last-analysis: uint }))
+  (/ (get risk-factors pattern) u2) ;; Convert risk factors to probability
+)
+
+(define-private (calculate-safe-loan-amount (user-data { score: uint, total-loans: uint, active-loans: uint, completed-loans: uint, defaulted-loans: uint, last-updated: uint }) (overall-risk uint))
+  (let (
+    (base-limit (if (>= (get score user-data) u800) u10000000
+                  (if (>= (get score user-data) u700) u5000000
+                    (if (>= (get score user-data) u600) u2000000 u500000))))
+    (risk-multiplier (if (> overall-risk u75) u50 ;; 50% of base for high risk
+                      (if (> overall-risk u50) u75 ;; 75% for medium risk
+                        u100))) ;; 100% for low risk
+    )
+    (/ (* base-limit risk-multiplier) u100)
+  )
+)
+
+(define-private (calculate-risk-adjusted-rate (user-data { score: uint, total-loans: uint, active-loans: uint, completed-loans: uint, defaulted-loans: uint, last-updated: uint }) (overall-risk uint))
+  (let (
+    (base-rate (if (>= (get score user-data) u800) u500
+                 (if (>= (get score user-data) u700) u750
+                   (if (>= (get score user-data) u600) u1000 u1500))))
+    (risk-premium (/ overall-risk u10)) ;; Add risk premium
+    )
+    (+ base-rate risk-premium)
+  )
+)
+
+(define-private (calculate-stability-index (pattern { avg-payment-delay: uint, payment-consistency: uint, loan-frequency: uint, repayment-velocity: uint, score-trajectory: int, risk-factors: uint, last-analysis: uint }))
+  (- u100 (min-value u100 (get risk-factors pattern)))
+)
+
+;; Read-only functions for accessing predictions and risk data
+
+(define-read-only (get-behavior-pattern (user principal))
+  (let (
+    (pattern (map-get? user-behavior-patterns { user: user }))
+    )
+    (if (is-some pattern)
+      (ok (unwrap-panic pattern))
+      (err ERR-INSUFFICIENT-HISTORY)
+    )
+  )
+)
+
+(define-read-only (get-prediction (user principal) (prediction-id uint))
+  (let (
+    (prediction (map-get? credit-predictions { user: user, prediction-id: prediction-id }))
+    )
+    (if (is-some prediction)
+      (ok (unwrap-panic prediction))
+      (err ERR-PREDICTION-NOT-FOUND)
+    )
+  )
+)
+
+(define-read-only (get-risk-profile (user principal))
+  (let (
+    (profile (map-get? risk-profiles { user: user }))
+    )
+    (if (is-some profile)
+      (ok (unwrap-panic profile))
+      (err ERR-INSUFFICIENT-HISTORY)
+    )
+  )
+)
+
+(define-read-only (get-personalized-insights (user principal))
+  (let (
+    (pattern (map-get? user-behavior-patterns { user: user }))
+    (profile (map-get? risk-profiles { user: user }))
+    )
+    (if (and (is-some pattern) (is-some profile))
+      (let (
+        (p (unwrap-panic pattern))
+        (r (unwrap-panic profile))
+        )
+        (ok {
+          risk-level: (determine-risk-category (get risk-factors p)),
+          improvement-potential: (if (< (get overall-risk-score r) u25) "Low" 
+                                  (if (< (get overall-risk-score r) u50) "Medium" "High")),
+          recommended-action: (if (> (get risk-factors p) u50) "Focus on payment consistency" 
+                               "Consider increasing credit utilization"),
+          stability-score: (get stability-index r)
+        })
+      )
+      (err ERR-INSUFFICIENT-HISTORY)
+    )
+  )
+)
+
+
+
+
+
+
