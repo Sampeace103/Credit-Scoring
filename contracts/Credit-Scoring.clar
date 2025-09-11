@@ -160,6 +160,9 @@
       { loan-ids: (unwrap! (as-max-len? (append (get loan-ids user-loan-data) loan-id) u50) ERR-NOT-AUTHORIZED) }
     )
     
+    ;; Apply referral rewards if user was referred
+    (apply-referral-reward tx-sender)
+    
     ;; Increment loan ID
     (var-set next-loan-id (+ loan-id u1))
     
@@ -1121,6 +1124,292 @@
         ))
       )
       (err ERR-ATTESTATION-NOT-FOUND)
+    )
+  )
+)
+
+;; === REFERRAL REWARDS SYSTEM ===
+
+;; Referral system error constants
+(define-constant ERR-REFERRAL-CODE-EXISTS (err u400))
+(define-constant ERR-REFERRAL-CODE-NOT-FOUND (err u401))
+(define-constant ERR-ALREADY-REFERRED (err u402))
+(define-constant ERR-SELF-REFERRAL (err u403))
+(define-constant ERR-REFERRAL-REWARD-ALREADY-CLAIMED (err u404))
+
+;; Referral system constants
+(define-constant REFERRAL-SCORE-BOOST u10)
+(define-constant MAX-REFERRAL-CODE u999999) ;; 6-digit codes
+(define-constant MIN-REFERRAL-CODE u100000) ;; 6-digit codes
+
+;; Map to store referral codes and their owners
+(define-map referral-codes
+  { code: uint }
+  {
+    referrer: principal,
+    created-at: uint,
+    total-uses: uint,
+    is-active: bool
+  }
+)
+
+;; Map to track who referred whom
+(define-map referral-claims
+  { invitee: principal }
+  {
+    referrer: principal,
+    referral-code: uint,
+    claimed-at: uint,
+    reward-claimed: bool
+  }
+)
+
+;; Map to track referrer statistics
+(define-map referrer-stats
+  { referrer: principal }
+  {
+    total-referrals: uint,
+    successful-referrals: uint, ;; Referrals that took loans
+    total-rewards-earned: uint,
+    last-referral: uint
+  }
+)
+
+;; Generate a pseudo-random referral code
+(define-private (generate-referral-code (user principal))
+  (let (
+    ;; Use a simpler approach: combine block height with a hash of the user
+    (user-hash (+ u1 (mod (len (unwrap-panic (to-consensus-buff? user))) u1000000)))
+    (block-component (mod stacks-block-height u100000))
+    (combined (+ user-hash (* block-component u7)))
+    (code (+ (mod combined (- MAX-REFERRAL-CODE MIN-REFERRAL-CODE)) MIN-REFERRAL-CODE))
+    )
+    code
+  )
+)
+
+;; Create a referral code for a user
+(define-public (create-referral-code)
+  (let (
+    (user-data (unwrap! (map-get? user-scores { user: tx-sender }) ERR-NOT-AUTHORIZED))
+    (generated-code (generate-referral-code tx-sender))
+    (existing-code (map-get? referral-codes { code: generated-code }))
+    )
+    
+    ;; Check if code already exists (retry with different input)
+    (asserts! (is-none existing-code) ERR-REFERRAL-CODE-EXISTS)
+    
+    ;; Create the referral code
+    (map-set referral-codes
+      { code: generated-code }
+      {
+        referrer: tx-sender,
+        created-at: stacks-block-height,
+        total-uses: u0,
+        is-active: true
+      }
+    )
+    
+    ;; Initialize referrer stats if not exists
+    (if (is-none (map-get? referrer-stats { referrer: tx-sender }))
+      (map-set referrer-stats
+        { referrer: tx-sender }
+        {
+          total-referrals: u0,
+          successful-referrals: u0,
+          total-rewards-earned: u0,
+          last-referral: stacks-block-height
+        }
+      )
+      true
+    )
+    
+    (ok generated-code)
+  )
+)
+
+;; Claim a referral code (must be done before taking first loan)
+(define-public (claim-referral (code uint))
+  (let (
+    (code-data (unwrap! (map-get? referral-codes { code: code }) ERR-REFERRAL-CODE-NOT-FOUND))
+    (referrer (get referrer code-data))
+    (existing-claim (map-get? referral-claims { invitee: tx-sender }))
+    (user-data (map-get? user-scores { user: tx-sender }))
+    )
+    
+    ;; Validation checks
+    (asserts! (get is-active code-data) ERR-REFERRAL-CODE-NOT-FOUND)
+    (asserts! (not (is-eq tx-sender referrer)) ERR-SELF-REFERRAL)
+    (asserts! (is-none existing-claim) ERR-ALREADY-REFERRED)
+    
+    ;; Initialize user if they don't exist
+    (if (is-none user-data)
+      (unwrap-panic (initialize-user))
+      true
+    )
+    
+    ;; Create referral claim
+    (map-set referral-claims
+      { invitee: tx-sender }
+      {
+        referrer: referrer,
+        referral-code: code,
+        claimed-at: stacks-block-height,
+        reward-claimed: false
+      }
+    )
+    
+    ;; Update code usage
+    (map-set referral-codes
+      { code: code }
+      (merge code-data {
+        total-uses: (+ (get total-uses code-data) u1)
+      })
+    )
+    
+    ;; Update referrer stats
+    (let (
+      (referrer-data (default-to 
+        {
+          total-referrals: u0,
+          successful-referrals: u0,
+          total-rewards-earned: u0,
+          last-referral: u0
+        }
+        (map-get? referrer-stats { referrer: referrer })
+      ))
+      )
+      (map-set referrer-stats
+        { referrer: referrer }
+        (merge referrer-data {
+          total-referrals: (+ (get total-referrals referrer-data) u1),
+          last-referral: stacks-block-height
+        })
+      )
+    )
+    
+    (ok referrer)
+  )
+)
+
+;; Apply referral rewards when user takes their first loan
+(define-private (apply-referral-reward (borrower principal))
+  (let (
+    (referral-claim (map-get? referral-claims { invitee: borrower }))
+    )
+    (if (is-some referral-claim)
+      (let (
+        (claim-data (unwrap-panic referral-claim))
+        (referrer (get referrer claim-data))
+        )
+        ;; Only apply reward if not already claimed
+        (if (not (get reward-claimed claim-data))
+          (begin
+            ;; Boost invitee's score
+            (let (
+              (invitee-data (unwrap-panic (map-get? user-scores { user: borrower })))
+              (new-invitee-score (min-value (+ (get score invitee-data) REFERRAL-SCORE-BOOST) MAX-SCORE))
+              )
+              (map-set user-scores
+                { user: borrower }
+                (merge invitee-data {
+                  score: new-invitee-score,
+                  last-updated: stacks-block-height
+                })
+              )
+            )
+            
+            ;; Boost referrer's score
+            (let (
+              (referrer-data (unwrap-panic (map-get? user-scores { user: referrer })))
+              (new-referrer-score (min-value (+ (get score referrer-data) REFERRAL-SCORE-BOOST) MAX-SCORE))
+              )
+              (map-set user-scores
+                { user: referrer }
+                (merge referrer-data {
+                  score: new-referrer-score,
+                  last-updated: stacks-block-height
+                })
+              )
+            )
+            
+            ;; Mark reward as claimed
+            (map-set referral-claims
+              { invitee: borrower }
+              (merge claim-data {
+                reward-claimed: true
+              })
+            )
+            
+            ;; Update referrer stats
+            (let (
+              (referrer-stats-data (unwrap-panic (map-get? referrer-stats { referrer: referrer })))
+              )
+              (map-set referrer-stats
+                { referrer: referrer }
+                (merge referrer-stats-data {
+                  successful-referrals: (+ (get successful-referrals referrer-stats-data) u1),
+                  total-rewards-earned: (+ (get total-rewards-earned referrer-stats-data) REFERRAL-SCORE-BOOST)
+                })
+              )
+            )
+            
+            true
+          )
+          false
+        )
+      )
+      false
+    )
+  )
+)
+
+;; Read-only functions for referral system
+
+(define-read-only (get-referral-code-info (code uint))
+  (let (
+    (code-data (map-get? referral-codes { code: code }))
+    )
+    (if (is-some code-data)
+      (ok (unwrap-panic code-data))
+      (err ERR-REFERRAL-CODE-NOT-FOUND)
+    )
+  )
+)
+
+(define-read-only (get-referral-claim (invitee principal))
+  (let (
+    (claim-data (map-get? referral-claims { invitee: invitee }))
+    )
+    (if (is-some claim-data)
+      (ok (unwrap-panic claim-data))
+      (err ERR-NOT-AUTHORIZED)
+    )
+  )
+)
+
+(define-read-only (get-referrer-stats (referrer principal))
+  (let (
+    (stats-data (map-get? referrer-stats { referrer: referrer }))
+    )
+    (if (is-some stats-data)
+      (ok (unwrap-panic stats-data))
+      (err ERR-NOT-AUTHORIZED)
+    )
+  )
+)
+
+(define-read-only (has-referral-rewards-pending (user principal))
+  (let (
+    (referral-claim (map-get? referral-claims { invitee: user }))
+    )
+    (if (is-some referral-claim)
+      (let (
+        (claim-data (unwrap-panic referral-claim))
+        )
+        (ok (not (get reward-claimed claim-data)))
+      )
+      (ok false)
     )
   )
 )
